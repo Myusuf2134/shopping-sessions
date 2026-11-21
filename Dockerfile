@@ -5,6 +5,7 @@ FROM python:3.12-slim-bookworm
 
 # The scorer runs the container as uid 1000; give that uid a name and a home.
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
+RUN mkdir -p /scratch && chown 1000:1000 /scratch
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
