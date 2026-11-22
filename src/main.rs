@@ -412,8 +412,16 @@ fn main() -> Result<()> {
     mark("lookups", &mut last);
 
     // ---- identity
-    let mut uf = UnionFind::default();
-    for path in csv_files(&data.join("links"))? { for_rows(&path, |line| if let Some(f) = parse_fields::<2>(line) { if let (Some(a), Some(b)) = (f[0], f[1]) { uf.union(ids, ids.id(a), ids.id(b)); } })?; }
+    // link lines are parsed in parallel; the union itself stays serial (any order gives the same
+    // components, and the root of each is its byte-wise smallest ID)
+    let link_pairs: Mutex<Vec<Vec<(Id, Id)>>> = Mutex::new(Vec::new());
+    parallel_fields::<2, _>(&csv_files(&data.join("links"))?, threads, Vec::new,
+        |v, f| if let (Some(a), Some(b)) = (f[0], f[1]) { v.push((ids.id(a), ids.id(b))); },
+        |v| link_pairs.lock().unwrap().push(v))?;
+    let link_pairs = link_pairs.into_inner().unwrap();
+    let mut uf = UnionFind { parent: dmap(link_pairs.iter().map(Vec::len).sum::<usize>() * 2) };
+    for v in &link_pairs { for &(a, b) in v { uf.union(ids, a, b); } }
+    drop(link_pairs);
     uf.flatten(); let uf = &uf;
     mark("identity", &mut last);
 
