@@ -516,18 +516,26 @@ fn main() -> Result<()> {
             attribute(ids, &people, &sessions, &clicks, acc, &ai, organic, sc);
         });
     mark("sessionize_attribute", &mut last);
+    // rules.md output: row order and file count do not matter, so each thread's user_daily rows
+    // go to their own file, written in parallel; campaign totals are summed over threads
     let mut acc = vec![CampaignAcc::default(); (ncamp + 1) * nday];
-    let mut user_rows = Vec::new();
-    for (a, rows, _) in states { for (x, y) in acc.iter_mut().zip(a) { x.sessions += y.sessions; x.purchasing += y.purchasing; x.revenue += y.revenue; x.assisted += y.assisted; } user_rows.extend(rows); }
-    if long { user_rows.sort_unstable_by(|a, b| ids.cmp(a.user, b.user).then(a.day.cmp(&b.day))); } else { user_rows.sort_unstable_by_key(|r| (r.user, r.day)); }
+    let mut user_parts: Vec<Vec<UserRow>> = Vec::new();
+    for (a, rows, _) in states { for (x, y) in acc.iter_mut().zip(a) { x.sessions += y.sessions; x.purchasing += y.purchasing; x.revenue += y.revenue; x.assisted += y.assisted; } if !rows.is_empty() { user_parts.push(rows); } }
+    if user_parts.is_empty() { user_parts.push(Vec::new()); }   // an empty table still needs one 0-row file
     let mut campaign_rows = Vec::new();
     for c in 0..ncamp as u32 { for d in min_day..=max_day { let a = acc[ai(c, d)].clone(); if a.sessions > 0 || a.assisted > 0 { campaign_rows.push((c, d, a)); } } }
     for d in min_day..=max_day { let a = acc[ai(organic, d)].clone(); if a.sessions > 0 { campaign_rows.push((organic, d, a)); } }
-    let cname = |c: u32| if c == organic { b"organic".as_slice() } else { campaign_ids[c as usize].as_slice() };
-    campaign_rows.sort_unstable_by(|a, b| cname(a.0).cmp(cname(b.0)).then(a.1.cmp(&b.1)));
-    mark("merge_sort", &mut last);
-    write_user(ids, &output.join("user_daily"), &user_rows, &categories)?;
-    write_campaign(&output.join("campaign_daily"), &campaign_rows, &campaign_ids, &channels)?;
+    mark("merge", &mut last);
+    fs::create_dir_all(output.join("user_daily"))?; fs::create_dir_all(output.join("campaign_daily"))?;
+    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    thread::scope(|s| {
+        for (i, rows) in user_parts.iter().enumerate() {
+            let (errors, output, categories) = (&errors, &output, &categories);
+            s.spawn(move || if let Err(e) = write_user(ids, &output.join("user_daily").join(format!("part-{i}.parquet")), rows, categories) { errors.lock().unwrap().push(e.to_string()); });
+        }
+        if let Err(e) = write_campaign(&output.join("campaign_daily").join("part-0.parquet"), &campaign_rows, &campaign_ids, &channels) { errors.lock().unwrap().push(e.to_string()); }
+    });
+    if let Some(e) = errors.into_inner().unwrap().first() { return Err(e.clone().into()); }
     mark("parquet_write", &mut last);
     Ok(())
 }
@@ -625,18 +633,17 @@ fn str_column<'a>(n: usize, vals: impl Iterator<Item = Option<&'a [u8]>>) -> Res
     for v in vals { match v { Some(s) => b.append_value(std::str::from_utf8(s)?), None => b.append_null() } }
     Ok(Arc::new(b.finish()))
 }
-fn write_user(ids: &Ids, path: &Path, rows: &[UserRow], categories: &[Vec<u8>]) -> Result<()> {
-    fs::create_dir_all(path)?;
+fn write_user(ids: &Ids, file: &Path, rows: &[UserRow], categories: &[Vec<u8>]) -> Result<()> {
     let schema = Arc::new(Schema::new(vec![Field::new("user_id", DataType::Utf8, false), Field::new("day", DataType::Date32, false), Field::new("sessions", DataType::Int64, false), Field::new("events", DataType::Int64, false), Field::new("revenue_cents", DataType::Int64, false), Field::new("top_category", DataType::Utf8, true)]));
     let arrays: Vec<ArrayRef> = vec![id_column(ids, rows)?, Arc::new(Date32Array::from_iter_values(rows.iter().map(|r| r.day))), Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.sessions))), Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.events))), Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.revenue))), str_column(rows.len(), rows.iter().map(|r| r.top.map(|i| categories[i as usize].as_slice())))?];
-    write_batch(path.join("part-0.parquet"), schema.clone(), RecordBatch::try_new(schema, arrays)?)
+    write_batch(file.to_path_buf(), schema.clone(), RecordBatch::try_new(schema, arrays)?)
 }
-fn write_campaign(path: &Path, rows: &[(u32, i32, CampaignAcc)], ids: &[Vec<u8>], channels: &[Vec<u8>]) -> Result<()> {
-    fs::create_dir_all(path)?; let organic = u32::MAX;
+fn write_campaign(file: &Path, rows: &[(u32, i32, CampaignAcc)], ids: &[Vec<u8>], channels: &[Vec<u8>]) -> Result<()> {
+    let organic = u32::MAX;
     let schema = Arc::new(Schema::new(vec![Field::new("campaign_id", DataType::Utf8, false), Field::new("channel", DataType::Utf8, false), Field::new("day", DataType::Date32, false), Field::new("sessions", DataType::Int64, false), Field::new("purchasing_sessions", DataType::Int64, false), Field::new("revenue_cents", DataType::Int64, false), Field::new("assisted_sessions", DataType::Int64, false)]));
     let arrays: Vec<ArrayRef> = vec![
         str_column(rows.len(), rows.iter().map(|(c, _, _)| Some(if *c == organic { b"organic".as_slice() } else { ids[*c as usize].as_slice() })))?,
         str_column(rows.len(), rows.iter().map(|(c, _, _)| Some(if *c == organic { b"organic".as_slice() } else { channels[*c as usize].as_slice() })))?,
         Arc::new(Date32Array::from_iter_values(rows.iter().map(|r| r.1))), Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2.sessions))), Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2.purchasing))), Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2.revenue))), Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2.assisted)))];
-    write_batch(path.join("part-0.parquet"), schema.clone(), RecordBatch::try_new(schema, arrays)?)
+    write_batch(file.to_path_buf(), schema.clone(), RecordBatch::try_new(schema, arrays)?)
 }
