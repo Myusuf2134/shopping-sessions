@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtOrd};
 use std::sync::{Arc, Mutex};
@@ -240,100 +239,129 @@ fn write_batch(path: PathBuf, schema: Arc<Schema>, batch: RecordBatch) -> Result
     writer.write(&batch)?; writer.close()?; Ok(())
 }
 
+// ------------------------------------------------------------------ parallel line reading
 //
-// Every file is cut into CHUNK-byte ranges. A line belongs to the range holding its first byte; a
-// line starts at a byte that follows a '\n' (byte 0 is the header and never a data line). So each
-// line is read exactly once, whatever the chunk size or thread count, and the result equals
-// for_rows(): no empty trailing line after a final '\n', a last line without '\n' is kept.
-const CHUNK: u64 = 8 << 20;
+// Every file is mapped read-only and cut into CHUNK-byte ranges. A line belongs to the range
+// holding its first byte; a line starts at a byte that follows a '\n' (byte 0 is the header and
+// never a data line). So each line is read exactly once, whatever the chunk size or thread count,
+// and the result equals for_rows(): no empty trailing line after a final '\n', a last line
+// without '\n' is kept.
+const CHUNK: usize = 8 << 20;
 /// SHOPPING_CHUNK overrides the chunk size (tests use tiny chunks to put boundaries everywhere)
-fn chunk_size() -> u64 { env::var("SHOPPING_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(CHUNK) }
-struct Chunk { file: usize, start: u64, end: u64 }
+fn chunk_size() -> usize { env::var("SHOPPING_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(CHUNK) }
 
-fn plan_chunks(paths: &[PathBuf]) -> Result<Vec<Chunk>> {
-    let mut out = Vec::new();
-    let size = chunk_size();
-    for (file, p) in paths.iter().enumerate() {
-        let len = fs::metadata(p)?.len();
-        let mut s = 0;
-        while s < len { let e = (s + size).min(len); out.push(Chunk { file, start: s, end: e }); s = e; }
+mod mm {
+    use std::fs::File;
+    use std::os::raw::{c_int, c_void};
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
+        fn munmap(addr: *mut c_void, len: usize) -> c_int;
     }
-    Ok(out)
-}
-
-fn read_at_full(f: &File, buf: &mut Vec<u8>, from: u64, len: usize) -> std::io::Result<()> {
-    let old = buf.len(); buf.resize(old + len, 0);
-    let mut done = 0;
-    while done < len {
-        let n = f.read_at(&mut buf[old + done..], from + done as u64)?;
-        if n == 0 { buf.truncate(old + done); break; }
-        done += n;
-    }
-    Ok(())
-}
-
-fn chunk_rows(f: &File, file_len: u64, c: &Chunk, buf: &mut Vec<u8>, mut row: impl FnMut(&[u8])) -> Result<()> {
-    buf.clear();
-    let base = if c.start == 0 { 0 } else { c.start - 1 };          // one byte back: was it a '\n'?
-    read_at_full(f, buf, base, (c.end - base) as usize)?;
-    let first_nl = match buf.iter().position(|&b| b == b'\n') { Some(i) => i, None => return Ok(()) };
-    let mut pos = first_nl + 1;                                       // buffer index of a line start
-    let owned_end = (c.end - base) as usize;                          // starts < this are ours
-    while pos < owned_end {
-        match buf[pos..].iter().position(|&b| b == b'\n') {
-            Some(i) => { row(&buf[pos..pos + i]); pos += i + 1; }
-            None => {
-                // the line runs past the chunk: read on until its '\n' or the end of the file
-                let mut at = base + buf.len() as u64;
-                let scan_from = buf.len();
-                let mut nl = None;
-                let mut from = scan_from;
-                while at < file_len {
-                    let want = (64 << 10).min((file_len - at) as usize);
-                    let before = buf.len();
-                    read_at_full(f, buf, at, want)?;
-                    if buf.len() == before { break; }
-                    at = base + buf.len() as u64;
-                    if let Some(i) = buf[from..].iter().position(|&b| b == b'\n') { nl = Some(from + i); break; }
-                    from = buf.len();
-                }
-                let end = nl.unwrap_or(buf.len());
-                if end > pos || nl.is_some() { row(&buf[pos..end]); }
-                break;
-            }
+    const PROT_READ: c_int = 1;
+    const MAP_PRIVATE: c_int = 2;   // same value on Linux and macOS
+    pub struct Map { ptr: *mut c_void, len: usize }
+    unsafe impl Send for Map {}
+    unsafe impl Sync for Map {}
+    impl Map {
+        pub fn open(f: &File) -> std::io::Result<Map> {
+            let len = f.metadata()?.len() as usize;
+            if len == 0 { return Ok(Map { ptr: std::ptr::null_mut(), len: 0 }); }
+            let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
+            if ptr as isize == -1 { return Err(std::io::Error::last_os_error()); }
+            Ok(Map { ptr, len })
         }
+        pub fn bytes(&self) -> &[u8] { if self.len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) } } }
     }
-    Ok(())
+    impl Drop for Map { fn drop(&mut self) { if self.len > 0 { unsafe { munmap(self.ptr, self.len); } } } }
 }
 
-/// Runs `work(chunk_rows)` over every chunk of `paths` on `threads` threads. Each thread gets its
-/// own state from `init` and hands it to `done` at the end.
-fn parallel_rows<S: Send>(paths: &[PathBuf], threads: usize, init: impl Fn() -> S + Sync,
-                          row: impl Fn(&mut S, &[u8]) + Sync, done: impl Fn(S) + Sync) -> Result<()> {
-    let chunks = plan_chunks(paths)?;
+// SWAR byte search: the high bit of each byte of eq_mask(w, b) is set exactly where w's byte == b
+// (the carry-free form, so no false positives after a match).
+const LO: u64 = 0x0101_0101_0101_0101;
+const HI7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+#[inline(always)] fn zero_mask(y: u64) -> u64 { !(((y & HI7).wrapping_add(HI7)) | y | HI7) }
+#[inline(always)] fn eq_mask(w: u64, b: u8) -> u64 { zero_mask(w ^ (LO * b as u64)) }
+
+#[inline] fn find_nl(data: &[u8], mut i: usize) -> Option<usize> {
+    while i + 8 <= data.len() {
+        let m = eq_mask(u64::from_le_bytes(data[i..i + 8].try_into().unwrap()), b'\n');
+        if m != 0 { return Some(i + (m.trailing_zeros() / 8) as usize); }
+        i += 8;
+    }
+    data[i..].iter().position(|&b| b == b'\n').map(|k| i + k)
+}
+
+/// One line from `pos`: returns (end, fields) where end is the index of its '\n' (or data.len())
+/// and fields is Some only if the line has exactly N fields and obeys the quote rule: the same
+/// result as parse_fields::<N>(&data[pos..end]).
+#[inline] fn scan_fields<const N: usize>(data: &[u8], pos: usize) -> (usize, Option<[Option<&[u8]>; N]>) {
+    let mut cut = [0usize; N]; let mut n = 0usize; let mut quote = false;
+    let mut i = pos;
+    let end = 'outer: loop {
+        if i + 8 <= data.len() {
+            let w = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+            let nl = eq_mask(w, b'\n'); let mut cm = eq_mask(w, b','); let mut q = eq_mask(w, b'"');
+            let stop = nl != 0;
+            if stop { let below = nl ^ (nl - 1); cm &= below; q &= below; }   // bytes before the '\n'
+            quote |= q != 0;
+            while cm != 0 { if n < N { cut[n] = i + (cm.trailing_zeros() / 8) as usize; } n += 1; cm &= cm - 1; }
+            if stop { break 'outer i + (nl.trailing_zeros() / 8) as usize; }
+            i += 8;
+        } else {
+            while i < data.len() {
+                match data[i] { b'\n' => break 'outer i, b',' => { if n < N { cut[n] = i; } n += 1; } b'"' => quote = true, _ => {} }
+                i += 1;
+            }
+            break data.len();
+        }
+    };
+    if n != N - 1 || end == pos { return (end, None); }
+    cut[N - 1] = end;
+    let mut out: [Option<&[u8]>; N] = [None; N];
+    let mut s = pos;
+    for k in 0..N {
+        let raw = &data[s..cut[k]]; s = cut[k] + 1;
+        let v = if quote && raw.contains(&b'"') {
+            if raw.len() < 2 || raw[0] != b'"' || raw[raw.len() - 1] != b'"' || raw[1..raw.len() - 1].contains(&b'"') { return (end, None); }
+            &raw[1..raw.len() - 1]
+        } else { raw };
+        out[k] = if v.is_empty() { None } else { Some(v) };
+    }
+    (end, Some(out))
+}
+
+/// Calls row(state, fields) for every well-formed N-field data line of every file, on `threads`
+/// threads; each thread's state comes from init() and goes to done() at the end.
+fn parallel_fields<const N: usize, S: Send>(paths: &[PathBuf], threads: usize, init: impl Fn() -> S + Sync,
+        row: impl Fn(&mut S, &[Option<&[u8]>; N]) + Sync, done: impl Fn(S) + Sync) -> Result<()> {
     let files: Vec<File> = paths.iter().map(File::open).collect::<std::io::Result<_>>()?;
-    let lens: Vec<u64> = files.iter().map(|f| f.metadata().map(|m| m.len())).collect::<std::io::Result<_>>()?;
+    let maps: Vec<mm::Map> = files.iter().map(mm::Map::open).collect::<std::io::Result<_>>()?;
+    let size = chunk_size();
+    let mut chunks = Vec::new();
+    for (f, m) in maps.iter().enumerate() { let len = m.bytes().len(); let mut s = 0; while s < len { let e = (s + size).min(len); chunks.push((f, s, e)); s = e; } }
     let next = AtomicUsize::new(0);
-    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    thread::scope(|s| {
+    thread::scope(|sc| {
         for _ in 0..threads {
-            s.spawn(|| {
+            sc.spawn(|| {
                 let mut st = init();
-                let mut buf = Vec::with_capacity(chunk_size().min(CHUNK) as usize + (64 << 10));
                 loop {
                     let i = next.fetch_add(1, AtOrd::Relaxed);
                     if i >= chunks.len() { break; }
-                    let c = &chunks[i];
-                    if let Err(e) = chunk_rows(&files[c.file], lens[c.file], c, &mut buf, |line| row(&mut st, line)) {
-                        errors.lock().unwrap().push(e.to_string()); break;
+                    let (f, start, cend) = chunks[i]; let data = maps[f].bytes();
+                    let first = if start == 0 { find_nl(data, 0) } else if data[start - 1] == b'\n' { Some(start - 1) } else { find_nl(data, start) };
+                    let Some(nl) = first else { continue; };
+                    let mut pos = nl + 1;
+                    while pos < cend {
+                        let (end, fields) = scan_fields::<N>(data, pos);
+                        if let Some(f) = fields { row(&mut st, &f); }
+                        pos = end + 1;
                     }
                 }
                 done(st);
             });
         }
     });
-    let errors = errors.into_inner().unwrap();
-    if let Some(e) = errors.first() { return Err(e.clone().into()); }
     Ok(())
 }
 
@@ -350,7 +378,6 @@ fn parallel_for<S: Send>(n: usize, threads: usize, init: impl Fn() -> S + Sync, 
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
 }
-
 
 fn take_all<T>(m: &Mutex<Vec<Vec<T>>>) -> Vec<T> {
     let vs = std::mem::take(&mut *m.lock().unwrap());
@@ -397,10 +424,10 @@ fn main() -> Result<()> {
     let per_part = ((event_bytes / 70) as usize / (threads * PARTS)) + 64;
     let products_r = &products;
     let parsed: Mutex<Vec<Vec<Vec<EvRec>>>> = Mutex::new(Vec::new());
-    parallel_rows(&event_paths, threads,
+    parallel_fields::<7, _>(&event_paths, threads,
         || (0..PARTS).map(|_| Vec::with_capacity(per_part)).collect::<Vec<Vec<EvRec>>>(),
-        |local, line| {
-            let Some(f) = parse_fields::<7>(line) else { return; }; let Some(eid) = f[0] else { return; };
+        |local, f| {
+            let Some(eid) = f[0] else { return; };
             let ingest = f[3].and_then(parse_ts).unwrap_or(i64::MAX);
             let kind = match f[4] { Some(b"view") => 1, Some(b"cart") => 2, Some(b"purchase") => 3, _ => 0 };
             let mut flags = 0u8;
@@ -452,10 +479,9 @@ fn main() -> Result<()> {
     let click_paths = csv_files(&data.join("clicks"))?;
     let campaigns_r = &campaigns;
     let cparsed: Mutex<Vec<Vec<Vec<Click>>>> = Mutex::new(Vec::new());
-    parallel_rows(&click_paths, threads,
+    parallel_fields::<4, _>(&click_paths, threads,
         || (0..PARTS).map(|_| Vec::new()).collect::<Vec<Vec<Click>>>(),
-        |local, line| {
-            let Some(f) = parse_fields::<4>(line) else { return; };
+        |local, f| {
             let (Some(id), Some(user), Some(camp), Some(tsb)) = (f[0], f[1], f[2], f[3]) else { return; };
             let Some(ts) = parse_ts(tsb) else { return; };
             if ts < ws - WEEK || ts >= we { return; }
