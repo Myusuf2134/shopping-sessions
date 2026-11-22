@@ -545,7 +545,8 @@ fn main() -> Result<()> {
     });
     if let Some(e) = errors.into_inner().unwrap().first() { return Err(e.clone().into()); }
     mark("parquet_write", &mut last);
-    Ok(())
+    // every output file is closed; skip freeing gigabytes of buffers one by one
+    std::process::exit(0)
 }
 
 #[derive(Default)]
